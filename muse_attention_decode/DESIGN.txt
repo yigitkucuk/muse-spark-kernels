@@ -1,0 +1,28 @@
+muse_attention_decode
+=====================
+
+Gated attention decode over a paged FP8 KV cache, one fused kernel per call:
+
+  O = rmsnorm(softmax(Q K^T * sm_scale) V) * sigmoid(gate)
+
+Q / K are RMS-normalized (Q also scaled by qk_scale_factor), RoPE is applied on sliding-window layers, new K / V are
+quantized to FP8 E4M3 and written to the cache by the same kernel. QK^T runs on FP8 tensor-core MMAs (queries in
+E4M3); PV on FP16 MMAs, or FP8 wgmma at q_len 8. Online softmax; no score matrix is materialized.
+
+Kernel
+------
+  unit of work   one CTA per (request, pair of KV heads = 16 query heads, split-KV split)
+  main loop      64-key tiles of the paged cache streamed through shared memory (TMA page indices, cp.async,
+                 multi-stage); on the flat kernel a producer warp issues every K / V copy
+  merge          splits rescaled to a fixed reference (QK-norm bounds the logits) and merged with FP32 atomics or
+                 TMA bulk reductions; the last CTA per (request, KV pair) normalizes, applies the gate, writes the
+                 output and zeroes the workspace for the next call
+  launch modes   per-request split-KV, per-request clusters (DSMEM reduction), flat (one pass over all requests'
+                 keys, full layers), cooperative finalize; _plan() picks one, each mode is its own template build
+
+Shapes the CUDA path does not cover use _fallback(), the same math in PyTorch.
+
+Files
+-----
+  py/00_attention_decode.py   plan, launch, fallback, kernel_fn
+  cuda/attention.cu           Cfg / Params / Smem, device helpers, segment loop, finalizes, attn_kernel, launchers

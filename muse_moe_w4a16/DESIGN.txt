@@ -1,0 +1,43 @@
+muse_moe_w4a16
+==============
+
+Routed experts with NVFP4 weights and BF16 activations, as one persistent kernel. Per token, up to 8 of 256 experts
+are active; this rank owns 32. Per expert: gate/up GEMM + SwiGLU, down GEMM, post-expert RMSNorm, weighted sum.
+
+Kernel
+------
+  routing     every CTA builds the same per-expert token lists from topk_ids (counts, offsets, sorted
+              (token, slot) entries) and a job list; experts with many tokens become fat jobs (chunks), the
+              rest skinny jobs; fat first, largest first
+  phase A     gate + up and SwiGLU into `inter` (bf16). Skinny unit: 16 rows x full K, warps split K, mma.sync.
+              Fat unit: 256 rows x full K streamed through shared memory in K stages
+  phase B     down projection from `inter`; epilogue multiplies by (1 + post_norm_w), writes rows to ybuf and
+              each route's sum of squares
+  final       out[t] = sum_s w[t, s] * rsqrt(ss / HIDDEN + eps) * ybuf, after a grid barrier (the WGS build
+              uses per-expert completion counters instead)
+
+Scheduling: one CTA per SM for both phases. Fat units round-robin; skinny units split by cost so every CTA
+carries the same total, plus a small atomically claimed tail pool (stream-K). Without fat jobs, phase A's last
+ring refills prefetch the CTA's first phase-B units.
+
+Builds by batch size (compile-time defines of one source): TINY, TINY2, MID (data-flag hand-off from phase A to B,
+no barrier), MAIN; for the large band MAIN switches to RS-wgmma (WGS) with 6-bit lossless block scales and a
+bf16 ybuf. Some batch sizes get a dedicated build with a ring-issuer warp.
+
+Weights are only repacked (bit / byte permutations) in prepare, never requantized: mma.sync order, fat order,
+unit-contiguous order, natural-k / WGS order.
+
+Sections (py/)
+--------------
+  00_moe_w4a16   constants, input types, source references
+  01_build_pack  extension builder, code / scale packing, 6-bit scale check, WGS copies
+  02_prepare     prepare, in-prepare A/B timing of builds
+  03_kernel_fn   scratch and kernel_fn
+  04_diag        input generator, graph timing, memory-pipeline diagnostics (not on the timed path)
+  05_wrappers    helper-warp source twin, per-thread CUDA context binding, per-batch-size builds
+
+CUDA sources (cuda/)
+--------------------
+  moe.cu       the kernel (all builds)
+  moe_var.cu   source of the small builds (TINY / TINY2 / MID)
+  moe_bw.cu    memory-pipeline microbenchmarks, diagnostics only

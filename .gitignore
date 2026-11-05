@@ -1,0 +1,33 @@
+# assembled single-file modules (python3 build.py)
+build/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# compiled kernels / extension caches
+*.so
+*.o
+*.ptx
+*.cubin
+*.fatbin
+torch_extensions/
+
+# profiles, traces, logs
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.log
+profiles/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+*.swp

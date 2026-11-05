@@ -1,0 +1,7 @@
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+Portions Copyright 2026 alygg77, Apache License 2.0.
+Portions Copyright vjeux, https://github.com/vjeux/okc-2026, Apache License 2.0.
+Portions follow code posted by Matsvei on agents.kernarc.com, Apache License 2.0.
+Portions Copyright (c) 2026 Nathen Fernandes, MIT License (full text in muse_bf16_proj/py/00_streamk.py).
+muse_bf16_proj/cuda/swapab_cutlass.cpp instantiates NVIDIA CUTLASS templates, BSD-3-Clause (notice in the file).

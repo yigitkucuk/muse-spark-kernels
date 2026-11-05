@@ -1,0 +1,71 @@
+muse_decode_layer
+=================
+
+One decoder layer step at decode / verify sizes (T = batch x q_len = 1..256 tokens). Inputs: the fp32 residual
+stream, the layer's BF16 input, a paged FP8 KV cache, 32 local NVFP4 experts of 256. Outputs: the next layer's
+normalized BF16 input, the new fp32 stream, the top-8 expert ids.
+
+Pipeline
+--------
+  1  qkv projection        T <= 32: GEMV on 12-bit losslessly packed BF16 weights (sk2); T = 128 / 256: stream-K
+                           GEMV (rs128) or a pinned cuBLASLt plan
+  2  attention             fused kernel: QK-norm, RoPE, FP8 cache write, split-KV FP8 attention, merge,
+                           per-head RMSNorm * sigmoid(gate)
+  3  o projection          then boundary 1: residual add, residual gate, pre-FFN norm
+  4  pooler + router       one fused launch; router in FP32 as BF16 hi + lo with FP32 accumulation;
+                           top-8 of biased sigmoid scores; pre-expert norm
+  5  routed experts        persistent NVFP4 W4A16 kernel (muse_moe_w4a16), compile-time builds by token count:
+                           TINY (<= 4), TINY2 (<= 8), MID (<= 16, data-flag hand-off between phases), WGS (> 16)
+  6  unpooler              then boundary 2: post-FFN norm, next layer's pre-attention norm
+
+Post-attention chain per T (picked in prepare by timing whole chains in place):
+  T = 1        persistent chain: o + boundary-1 prologue -> fused pooler/router -> route -> MoE TINY ->
+               unpooler slice -> finish
+  T = 8        o (sk2) -> 8-CTA cluster boundary -> pooler/router -> tile route -> MoE TINY2 -> unpooler slice ->
+               cluster finish
+  T = 16, 32   o (sk2) -> cluster / Gluon row boundary -> fused pooler/router -> route -> MoE MID / WGS ->
+               unpooler (sk2) -> boundary 2
+  T = 128, 256 o (cuBLASLt) -> row boundary -> pooler + router hi + lo as one GEMM -> route -> MoE WGS ->
+               unpooler (rs128 / cuBLASLt) -> row boundary
+Untuned token counts take the next tuned bucket's choices. Consecutive launches overlap through programmatic
+dependent launch (weights are fetched before griddepcontrol.wait).
+
+Composition
+-----------
+Sections 00-06 are a complete implementation. Each later section rebinds prepare / kernel_fn / _after_attention
+(or a backend such as _moe) and wraps the previous binding to add a faster path; the last binding of a name is
+the live one. Added paths are self-tested in prepare against the path they replace and fall back to it on
+failure.
+
+Sections (py/)
+--------------
+  00_config_attention  model shape, PDL policy, fused-attention launcher and plan
+  01_moe               MoE extension builds, NVFP4 repacking (mma, fat, unit and WGS orders; 6-bit scale planes)
+  02_dense_bfp         dense kernels: 12-bit lossless packing, escape tables, sk2 / TMA / wide / gq launchers,
+                       autotune
+  03_layer_helpers     dense and MoE prepare glue, MoE scratch, fragment repacking
+  04_triton_kernels    Triton split-K GEMM, norm-gate, QK prep, split-KV attention fallback, boundaries, routing
+  05_tune              Marlin path, cold-L2 graph timing, routing calibration, per-T tuner, base prepare
+  06_kernel_fn         base kernel_fn and post-attention chain
+  07_link_chain        cluster and Gluon row boundaries, fused route, pinned cuBLASLt plans; chain for T = 16..256
+  08_compose           in-place timing of whole chains, chain choice per T
+  09_sl_chain          T <= 8 cluster finish and tile route
+  10_context_router    per-thread CUDA context binding, FP32 router GEMV
+  11_gle               T = 1 persistent post-attention chain
+  12_streamk           stream-K GEMVs at T = 128 / 256 (qkv, unpooler), in-prepare plan bake
+  13_moe_timing        paired in-prepare timing of MoE builds (with / without the grid barrier)
+  14_calib             routing-bias calibration so synthetic tuning inputs load experts like real ones
+  15_nr_route          pooler/router without the last-arriver handshake; the route kernel sums the partials
+  16_df8               data-flag hand-off extended to T = 5..8, sentinel rows
+  17_moev              WGS MoE variant for T > 32 (5-bit scale pieces, source patcher), built in the background
+
+CUDA sources (cuda/)
+--------------------
+  att7.cu              fused attention decode
+  moe.cu               NVFP4 MoE kernel, all builds
+  moe_helper0.cu       MoE source twin with the TMA helper warp as warp 0 (MID build)
+  bfp*.cu              dense GEMV / GEMM kernels and TMA / mbarrier helpers
+  streamk_rqcu.cu      stream-K GEMV (rs128); streamk_flush.cu: cold-L2 read flush for timing
+  link_glue.cu, link_b2.cu, sl_glue.cu   cluster boundary / finish kernels
+  gle_epi.cpp          T = 1 chain epilogue bindings
+  router_fp32.cu       FP32 router GEMV

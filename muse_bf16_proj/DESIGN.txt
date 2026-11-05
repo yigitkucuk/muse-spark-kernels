@@ -1,0 +1,42 @@
+muse_bf16_proj
+==============
+
+The five dense projections of the layer, out[m, n] = x[m, K] @ W[n, K]^T:
+
+  qkv_gate  2304 x 8192     o  8192 x 1024     pooler  4096 x 8192     unpooler  8192 x 4096
+  router    256 x 8192, FP32 weights, run as an exact BF16 hi + lo pair with FP32 accumulation
+
+at m = 1..384 tokens. Weights stay exact; the small-m paths read them in a lossless 12-bit code (common exponent
+patterns coded, the rest patched from an escape table), which cuts HBM bytes by a quarter on a bandwidth-bound
+problem.
+
+Backends
+--------
+Each (layer, m) routes to one backend (_TABLE in 04_dispatch); every backend is a factory that returns its own
+prepare / kernel_fn.
+
+  streamk   stream-K skinny GEMM (m <= 32 and the router at any m): W repacked in mma.sync fragment order, every
+            warp streams an equal contiguous range of (tile, chunk) units, split tiles meet through FP32 atomics;
+            register-direct GEMV on 12-bit planes; stream-K GEMM for m = 128 / 256
+  swapab    swap-AB tensor-core GEMV / GEMM: sk2 (m <= 32), wide (m 33..128), gq / gqx SS-wgmma (m 33..256),
+            router GEMV / GEMM, TMA weight streams
+  nb        router tail at m = 8..32 on 12-bit planes with DSMEM cluster reduction; o at m = 128
+  ag        cuBLASLt plans pinned per shape (m = 256)
+
+Off-pin m (not 1 / 8 / 16 / 32 / 128 / 256) get a route built and validated in prepare from the neighbouring pins.
+Every path is validated against a reference and timed with CUDA graph replays from a cold L2 (a read sweep larger
+than L2 before each replay, paired order-swapped runs, graph fixed cost subtracted).
+
+Sections (py/)
+--------------
+  00_streamk    streamk backend
+  01_swapab     swapab backend
+  02_smallm     nb backend
+  03_lt         ag backend (ctypes cuBLASLt wrapper, pinned plans)
+  04_dispatch   route table, off-pin route builder, prepare, kernel_fn, per-thread CUDA context binding
+
+CUDA sources (cuda/)
+--------------------
+  streamk*.cu / .cpp   stream-K GEMM / GEMV kernels, 12-bit decoders, cuBLASLt glue, cold-L2 flush
+  swapab*.cu / .cpp    swap-AB kernels, TMA / mbarrier helpers, CUTLASS GEMM (built only with _PRUNE off)
+  nb_rt.cu, nb_ol.cu   router tail and o at m = 128

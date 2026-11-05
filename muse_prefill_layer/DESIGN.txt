@@ -1,0 +1,44 @@
+muse_prefill_layer
+==================
+
+One transformer layer step over a prefill batch. Every stage is one launch or a few, in data-dependency order.
+
+Pipeline
+--------
+  1  QKV projection        cuBLASLt with an algorithm pinned per shape in prepare (else torch.mm)
+  2  Q/K prep              RMS-norm of Q and K, RoPE, FP8 Q, K / V into the paged cache (CUDA kernel; Triton twin as
+                           fallback)
+  3  attention             warp-specialized FP8 FMHA (PV and the softmax row sum as one m64n72k32 wgmma), the
+                           attn_fwd kernel, or FA3 + fused norm * sigmoid(gate); chosen per shape class after
+                           validation
+  4  o projection          then boundary 1: stream = alpha * stream + beta * rms(branch), next input
+                           rms(stream) * (1 + g_pre); also zeroes the MoE work counters
+  5  router + pooler       router GEMM and top-8 on a side stream, pooler GEMM on the main stream
+  6  grouped MoE           gather with the pre-expert norm into per-expert rows; one persistent kernel runs both
+                           expert GEMMs with NVFP4 dequantized in registers as the wgmma A operand; SiLU * up fused
+  7  combine + unpooler    per-route rows combined with per-expert RMS-norm and routing weights, unpooler GEMM,
+                           boundary 2 (large T rebuilds the fp32 stream from boundary 1's saved RMS factor)
+
+prepare builds the extensions, repacks the NVFP4 experts, and tunes the cuBLASLt algorithm per GEMM and the
+attention variant per shape class; nothing else carries over between calls.
+
+Sections (py/)
+--------------
+  00_layer        geometry, Triton kernels (QK prep, norm-gate, boundary, combine), prepare
+  01_dense_lt     cuBLASLt pinning and tuning, GEMM dispatch
+  02_moe_pack     NVFP4 code / scale repacking
+  03_attention    attention paths, validation, per-shape-class choice
+  04_moe_forward  MoE launch sequence, QK-prep and attention runners
+  05_fmha         FMHA build, split pick, launch, prepare
+  06_kernel_fn    per-thread CUDA context binding, kernel_fn
+  07_selftest     self-tests (check runs only)
+  08_build        extension builds, source references
+
+CUDA sources (cuda/)
+--------------------
+  prefill.cu            expert GEMMs (fused persistent kernel), routing plan, gather, route, combine, Q/K prep,
+                        boundaries, attention (attn_fwd, stream-K variant)
+  fmha.cu               FP8 prefill FMHA and K/V gather
+  glue.cu               host launchers (programmatic dependent launch)
+  prefill_bindings.cpp  torch bindings
+  lt_glue.cpp           cuBLASLt wrapper with a pinned algorithm config
