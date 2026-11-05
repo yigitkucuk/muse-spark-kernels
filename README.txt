@@ -1,5 +1,5 @@
-muse-spark-okc
-==============
+muse-spark-kernels
+==================
 
 CUDA kernels for one Muse Spark transformer layer on H200 (sm_90a): decode, prefill, and the three components
 they are built from (routed experts, attention decode, dense projections).
@@ -36,3 +36,8 @@ without them the native kernels run.
 Numerics, all kernels: BF16 weights stay exact (dense paths may store them in a lossless 12-bit code with escape
 correction); NVFP4 experts are repacked, never requantized; FP32 accumulation; FP8 E4M3 KV cache and queries;
 router in FP32 or as an exact BF16 hi + lo pair.
+
+License
+-------
+  MIT (LICENSE). Portions from other authors keep their own licenses, as marked in each file's header: Apache 2.0
+  (LICENSE-APACHE), MIT, and BSD-3-Clause for the CUTLASS templates. NOTICE lists them.
