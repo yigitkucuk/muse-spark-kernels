@@ -39,5 +39,5 @@ router in FP32 or as an exact BF16 hi + lo pair.
 
 License
 -------
-  MIT (LICENSE). Portions from other authors keep their own licenses, as marked in each file's header: Apache 2.0
-  (LICENSE-APACHE), MIT, and BSD-3-Clause for the CUTLASS templates. NOTICE lists them.
+  MIT (LICENSE). Files that include code from other projects say so in their header; third_party/ holds
+  those projects' license text.
